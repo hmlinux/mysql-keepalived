@@ -1,0 +1,123 @@
+#!/bin/bash
+VIP="172.16.10.28"
+interface=eth1
+LOGFILE="/usr/local/keepalived/log/notify_scripts.log"
+sharedisk=/dev/sdb1
+mount_point=/oradata
+ORACLE_SID=HMODB
+
+[ -d $LOGDIR ] || mkdir $LOGDIR
+
+check_instance_is_open() {
+    su - oracle << EOF
+    export ORACLE_SID=$ORACLE_SID
+    sqlplus -S "/ as sysdba"
+    SELECT STATUS FROM V\$INSTANCE;
+    exit
+EOF
+}
+
+startup_oracle() {
+    su - oracle << EOF
+    export ORACLE_SID=$ORACLE_SID
+    sqlplus -S "/ as sysdba"
+    startup
+    exit
+EOF
+}
+
+shutdown_oracle() {
+    su - oracle << EOF
+    export ORACLE_SID=$ORACLE_SID
+    sqlplus -S "/ as sysdba"
+    shutdown immediate
+    exit
+EOF
+}
+
+master() {
+    disk=`mount | grep $sharedisk | grep -Eio "\brw\b"`
+    if [ "$disk" == "rw" ];then
+        echo "`date '+%b  %d %T %a'` $HOSTNAME [keepalived_notify_script]: $sharedisk already mounted on $mount_point"
+    else
+        echo "`date '+%b  %d %T %a'` $HOSTNAME [keepalived_notify_script]: mount $sharedisk on $mount_point ..."
+        mount $sharedisk $mount_point && sleep 1
+        if [ $? -ne 0 ];then
+            echo "`date '+%b  %d %T %a'` $HOSTNAME [keepalived_notify_script]: Error. $sharedisk cannot mounted"
+        fi
+    fi
+    
+    status=`check_instance_is_open | grep -Eio "\bOPEN\b"`
+    if [ "$status" == "OPEN" ];then
+        echo "`date '+%b  %d %T %a'` $HOSTNAME [keepalived_notify_script]: instance is open."
+    else
+        echo "`date '+%b  %d %T %a'` $HOSTNAME [keepalived_notify_script]: start oracle and instance ..."
+        startup_oracle
+    fi
+
+    listen=`runuser -l oracle -c "tnsping $ORACLE_SID" &>/dev/null`
+    if [ $? -ne 0 ];then
+        runuser -l oracle -c "lsnrctl start"
+    fi
+}
+
+
+backup() {
+    status=`check_instance_is_open | grep -Eio "\bOPEN\b"`
+    if [ "$status" == "OPEN" ];then
+        echo "`date '+%b  %d %T %a'` $HOSTNAME [keepalived_notify_script]: shutdown instance"
+        shutdown_oracle
+    else
+        echo "`date '+%b  %d %T %a'` $HOSTNAME [keepalived_notify_script]: ORACLE not available"
+    fi
+
+    listen=`runuser -l oracle -c "tnsping $ORACLE_SID" &>/dev/null`
+    if [ $? -eq 0 ];then
+        runuser -l oracle -c "lsnrctl stop"
+    fi
+
+    disk=`mount | grep $sharedisk | grep -Eio "\brw\b" | grep -Eio r`
+    if [ "$disk" == "rw" -o "$disk" == "r" ];then
+        echo "`date '+%b  %d %T %a'` $HOSTNAME [keepalived_notify_script]: umount $mount_point"
+        umount $mount_point && sleep 1
+    else
+        echo "`date '+%b  %d %T %a'` $HOSTNAME [keepalived_notify_script]: $mount_point not mounted"
+    fi   
+}
+
+notify_master() {
+    echo "`date '+%b  %d %T %a'` $HOSTNAME [keepalived_notify_script]: Transition to $1 STATE";
+    echo "`date '+%b  %d %T %a'` $HOSTNAME [keepalived_notify_script]: Setup the VIP on eth1 for $VIP";
+}
+
+notify_backup() {
+    echo "`date '+%b  %d %T %a'` $HOSTNAME [keepalived_notify_script]: Transition to $1 STATE";
+    echo "`date '+%b  %d %T %a'` $HOSTNAME [keepalived_notify_script]: removing the VIP on eth1 for $VIP";
+}
+
+case $1 in
+        master)
+                notify_master MASTER
+                master
+                exit 0
+        ;;
+        backup)
+                notify_backup BACKUP
+                backup
+                exit 0
+        ;;
+        fault)
+                notify_backup FAULT
+		backup
+                exit 0
+        ;;
+        stop)
+                notify_backup STOP
+                backup
+                exit 0
+        ;;
+        *)
+                echo "Usage: `basename $0` {master|backup|fault|stop}"
+                exit 1
+        ;;
+esac
